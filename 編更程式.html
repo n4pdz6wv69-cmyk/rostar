@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GFE 排更系統</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- Html2Canvas -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+        // --- 1. Firebase 設定 ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyDmBeN8-6Sam-mOtfloLt4x44jJePE5xso",
+            authDomain: "teamroster-ab0e2.firebaseapp.com",
+            projectId: "teamroster-ab0e2",
+            storageBucket: "teamroster-ab0e2.firebasestorage.app",
+            messagingSenderId: "932509054150",
+            appId: "1:932509054150:web:6f809bfb2ff4752a7c53c7"
+        };
+
+        // 嘗試自動檢測環境變數 (如果在某些特定的 Hosting 環境)
+        const configToUse = (typeof window.__firebase_config !== 'undefined') 
+            ? JSON.parse(window.__firebase_config) 
+            : firebaseConfig;
+
+        // 初始化 Firebase
+        let app, auth, db;
+        try {
+            app = initializeApp(configToUse);
+            auth = getAuth(app);
+            db = getFirestore(app);
+        } catch (e) {
+            console.error("Firebase Init Error:", e);
+            alert("Firebase 初始化失敗。請檢查 Config 設定。");
+        }
+
+        // 修正：優先使用環境變數中的 App ID，否則使用預設值
+        const appId = (typeof window.__app_id !== 'undefined') ? window.__app_id : 'gfe-roster-app';
+
+        // --- 2. 應用程式狀態 (State) ---
+        const state = {
+            user: null,
+            employees: [],
+            selectedEmpId: null,
+            shifts: {}, // { "2025-01-01": "SHIFT_A", ... }
+            currentDate: new Date(),
+            isSidebarOpen: true,
+            isSaving: false
+        };
+
+        // --- 3. 配置數據 ---
+        const HK_HOLIDAYS = {
+            '2025-01-01': '元旦',
+            '2025-01-29': '農曆年初一',
+            '2025-01-30': '農曆年初二',
+            '2025-01-31': '農曆年初三',
+            '2025-04-04': '清明節',
+            '2025-04-18': '耶穌受難節',
+            '2025-04-19': '耶穌受難節翌日',
+            '2025-04-21': '復活節星期一',
+            '2025-05-01': '勞動節',
+            '2025-05-05': '佛誕',
+            '2025-05-31': '端午節',
+            '2025-07-01': '特區成立日',
+            '2025-10-01': '國慶日',
+            '2025-10-07': '中秋節翌日',
+            '2025-10-29': '重陽節',
+            '2025-12-25': '聖誕節',
+            '2025-12-26': '聖誕節後第一個周日',
+            '2026-01-01': '元旦',
+            '2026-02-17': '農曆年初一',
+            '2026-02-18': '農曆年初二',
+            '2026-02-19': '農曆年初三',
+            '2026-04-03': '耶穌受難節',
+            '2026-04-04': '耶穌受難節翌日',
+            '2026-04-06': '復活節星期一',
+            '2026-05-01': '勞動節',
+            '2026-05-24': '佛誕',
+            '2026-06-19': '端午節',
+            '2026-07-01': '特區成立日',
+            '2026-09-26': '中秋節翌日',
+            '2026-10-01': '國慶日',
+            '2026-10-20': '重陽節',
+            '2026-12-25': '聖誕節',
+            '2026-12-26': '聖誕節後第一個周日',
+        };
+
+        // --- 4. 輔助函數 ---
+        const getDaysInMonth = (year, month) => new Date(year, month + 1, 0).getDate();
+        const getFirstDayOfMonth = (year, month) => new Date(year, month, 1).getDay(); // 0 is Sunday
+        
+        function getShiftStyle(type) {
+            switch (type) {
+                case 'UNAVAILABLE': return 'bg-gray-800 text-gray-200 border-gray-900';
+                case 'SHIFT_A': return 'bg-blue-100 text-blue-800 border-blue-200 hover:bg-blue-200';
+                case 'SHIFT_B': return 'bg-green-100 text-green-800 border-green-200 hover:bg-green-200';
+                default: return 'bg-white hover:bg-gray-50';
+            }
+        }
+
+        function getShiftLabel(type) {
+            switch (type) {
+                case 'UNAVAILABLE': return 'OFF';
+                case 'SHIFT_A': return 'Shift A';
+                case 'SHIFT_B': return 'Shift B';
+                default: return '';
+            }
+        }
+
+        function getShiftIcon(type) {
+            switch (type) {
+                case 'UNAVAILABLE': return 'ban';
+                case 'SHIFT_A': return 'sun';
+                case 'SHIFT_B': return 'moon';
+                default: return '';
+            }
+        }
+
+        // --- 5. 核心邏輯與監聽 ---
+
+        // Authentication Logic
+        async function initAuth() {
+            try {
+                if (typeof window.__initial_auth_token !== 'undefined' && window.__initial_auth_token) {
+                    await signInWithCustomToken(auth, window.__initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (e) {
+                console.error("Auth Init Failed:", e);
+                // 如在本地運行失敗，可忽略此錯誤或檢查 Config
+            }
+        }
+
+        onAuthStateChanged(auth, (user) => {
+            state.user = user;
+            updateUI();
+            if (user) {
+                initListeners();
+            }
+        });
+
+        // 啟動登入流程
+        initAuth();
+
+        // Firestore Listeners
+        let empUnsub, shiftUnsub;
+
+        function initListeners() {
+            // Listen to Employees
+            const empCol = collection(db, 'artifacts', appId, 'public', 'data', 'gfe_employees');
+            empUnsub = onSnapshot(empCol, (snapshot) => {
+                const emps = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                emps.sort((a, b) => a.createdAt - b.createdAt);
+                state.employees = emps;
+                
+                if (emps.length > 0 && !state.selectedEmpId) {
+                    state.selectedEmpId = emps[0].id;
+                }
+                renderSidebarList();
+                renderHeader();
+                
+                // If selectedEmpId changes or initiates, listen to shifts
+                if (state.selectedEmpId) {
+                    subscribeToShifts(state.selectedEmpId);
+                }
+            }, (error) => {
+                console.error("Error fetching employees:", error);
+            });
+        }
+
+        function subscribeToShifts(empId) {
+            if (shiftUnsub) shiftUnsub(); // Unsubscribe prev
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'gfe_shifts', empId);
+            shiftUnsub = onSnapshot(docRef, (docSnap) => {
+                state.shifts = docSnap.exists() ? docSnap.data() : {};
+                renderCalendar();
+            }, (error) => {
+                console.error("Error fetching shifts:", error);
+            });
+        }
+
+        // --- 6. UI 渲染函數 (Render Functions) ---
+
+        function updateUI() {
+            // Toggle login loading state if needed
+            const loadingEl = document.getElementById('auth-loading');
+            if (state.user) loadingEl.classList.add('hidden');
+        }
+
+        function renderSidebarList() {
+            const container = document.getElementById('employee-list');
+            container.innerHTML = '';
+
+            if (state.employees.length === 0) {
+                container.innerHTML = `<div class="text-center py-10 text-gray-400">暫無同事資料<br>請在下方新增</div>`;
+                return;
+            }
+
+            state.employees.forEach(emp => {
+                const div = document.createElement('div');
+                const isSelected = state.selectedEmpId === emp.id;
+                div.className = `p-3 rounded-lg cursor-pointer flex justify-between items-center transition-all ${isSelected ? 'bg-blue-50 border-l-4 border-blue-500 shadow-sm' : 'hover:bg-gray-50 border-l-4 border-transparent'}`;
+                div.onclick = () => selectEmployee(emp.id);
+                
+                div.innerHTML = `
+                    <div class="font-medium text-slate-700">${emp.name}</div>
+                    <button class="text-gray-300 hover:text-red-500 p-1 hover:bg-red-50 rounded delete-btn" onclick="deleteEmployee(event, '${emp.id}')">
+                        <i data-lucide="trash-2" class="w-4 h-4"></i>
+                    </button>
+                `;
+                container.appendChild(div);
+            });
+            lucide.createIcons();
+        }
+
+        function renderHeader() {
+            const currentEmp = state.employees.find(e => e.id === state.selectedEmpId);
+            const name = currentEmp ? currentEmp.name : '未選擇同事';
+            document.getElementById('header-title').innerText = `${name} 的更表`;
+            document.getElementById('calendar-subtitle').innerText = name;
+        }
+
+        function renderCalendar() {
+            const year = state.currentDate.getFullYear();
+            const month = state.currentDate.getMonth();
+            
+            // Header
+            document.getElementById('calendar-month-year').innerText = `${year}年 ${month + 1}月`;
+
+            // Grid
+            const grid = document.getElementById('calendar-grid');
+            grid.innerHTML = '';
+
+            const daysInMonth = getDaysInMonth(year, month);
+            const firstDayOfWeek = getFirstDayOfMonth(year, month);
+            const paddingDays = firstDayOfWeek === 0 ? 6 : firstDayOfWeek - 1; // Mon start
+
+            // Padding
+            for(let i=0; i<paddingDays; i++) {
+                const div = document.createElement('div');
+                div.className = 'bg-gray-50 min-h-[100px]';
+                grid.appendChild(div);
+            }
+
+            // Days
+            for(let i=1; i<=daysInMonth; i++) {
+                const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(i).padStart(2, '0')}`;
+                const shiftType = state.shifts[dateStr];
+                const isHoliday = HK_HOLIDAYS[dateStr];
+
+                const cell = document.createElement('div');
+                cell.className = `relative min-h-[100px] p-2 flex flex-col group transition-colors cursor-pointer border-gray-100 ${getShiftStyle(shiftType)}`;
+                cell.onclick = (e) => openShiftMenu(e, dateStr);
+
+                let iconHtml = '';
+                if(shiftType) {
+                    const iconName = getShiftIcon(shiftType);
+                    // We need to inject SVG directly or use a placeholder for Lucide to replace
+                    iconHtml = `<i data-lucide="${iconName}" class="w-4 h-4 mb-1"></i>`;
+                }
+
+                cell.innerHTML = `
+                    <div class="flex justify-between items-start mb-2">
+                        <span class="text-lg font-bold leading-none ${(isHoliday || (paddingDays + i) % 7 === 0) ? 'text-red-500' : 'text-slate-700'} ${shiftType === 'UNAVAILABLE' ? 'text-gray-400' : ''}">${i}</span>
+                        ${isHoliday ? `<span class="text-[10px] font-bold text-red-600 bg-red-50 px-1.5 py-0.5 rounded border border-red-100 truncate max-w-[70px]">${isHoliday}</span>` : ''}
+                    </div>
+                    <div class="flex-1 flex flex-col items-center justify-center">
+                        ${iconHtml}
+                        ${shiftType ? `<span class="text-sm font-bold">${getShiftLabel(shiftType)}</span>` : ''}
+                    </div>
+                    <!-- Hover Effect -->
+                    <div class="absolute inset-0 bg-black/5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center pointer-events-none">
+                        <span class="text-xs font-medium text-slate-500 bg-white/80 px-2 py-1 rounded-full shadow-sm backdrop-blur-sm">點擊修改</span>
+                    </div>
+                `;
+                grid.appendChild(cell);
+            }
+            
+            lucide.createIcons();
+        }
+
+        // --- 7. 操作邏輯 (Actions) ---
+
+        window.addEmployee = async () => {
+            const input = document.getElementById('new-emp-name');
+            const name = input.value.trim();
+            if(!name || !state.user) return;
+
+            setSaving(true);
+            try {
+                const newRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'gfe_employees'));
+                await setDoc(newRef, { name, createdAt: Date.now() });
+                input.value = '';
+                selectEmployee(newRef.id);
+            } catch(e) { console.error(e); alert('新增失敗'); }
+            setSaving(false);
+        };
+
+        window.deleteEmployee = async (e, id) => {
+            e.stopPropagation();
+            if(!confirm('確定刪除?')) return;
+            setSaving(true);
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'gfe_employees', id));
+                if(state.selectedEmpId === id) state.selectedEmpId = null;
+            } catch(e) { console.error(e); }
+            setSaving(false);
+        };
+
+        window.selectEmployee = (id) => {
+            state.selectedEmpId = id;
+            renderSidebarList();
+            renderHeader();
+            subscribeToShifts(id);
+            // On mobile, close sidebar
+            if(window.innerWidth < 768) toggleSidebar();
+        };
+
+        // Shift Menu Logic
+        let activeDate = null;
+        window.openShiftMenu = (e, dateStr) => {
+            e.stopPropagation();
+            activeDate = dateStr;
+            const menu = document.getElementById('shift-menu');
+            
+            // Position near click
+            menu.style.top = `${e.clientY}px`;
+            menu.style.left = `${e.clientX}px`;
+            
+            // Boundary check (simple)
+            if (e.clientX > window.innerWidth - 150) menu.style.left = `${e.clientX - 140}px`;
+
+            menu.classList.remove('hidden');
+            
+            // Close on outside click
+            const closeMenu = () => {
+                menu.classList.add('hidden');
+                document.removeEventListener('click', closeMenu);
+            };
+            setTimeout(() => document.addEventListener('click', closeMenu), 0);
+        };
+
+        window.setShift = async (type) => {
+            if(!activeDate || !state.selectedEmpId) return;
+            
+            const newShifts = { ...state.shifts };
+            if(type === 'CLEAR') delete newShifts[activeDate];
+            else newShifts[activeDate] = type;
+            
+            // Optimistic update
+            state.shifts = newShifts;
+            renderCalendar();
+
+            setSaving(true);
+            try {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'gfe_shifts', state.selectedEmpId), newShifts);
+            } catch(e) { console.error(e); }
+            setSaving(false);
+        };
+
+        // Quick Input
+        window.toggleQuickInput = () => {
+            const modal = document.getElementById('quick-input-modal');
+            modal.classList.toggle('hidden');
+        };
+
+        window.submitQuickInput = async () => {
+            const val = document.getElementById('quick-input-text').value;
+            if(!val || !state.selectedEmpId) return;
+
+            const days = val.split(/[,，\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0 && n <= 31);
+            const year = state.currentDate.getFullYear();
+            const month = state.currentDate.getMonth();
+            const newShifts = { ...state.shifts };
+
+            days.forEach(day => {
+                const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                newShifts[dateStr] = 'UNAVAILABLE';
+            });
+
+            state.shifts = newShifts;
+            renderCalendar();
+            toggleQuickInput();
+            document.getElementById('quick-input-text').value = '';
+            
+            setSaving(true);
+            try {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'gfe_shifts', state.selectedEmpId), newShifts);
+            } catch(e) { console.error(e); }
+            setSaving(false);
+        };
+
+        // Month Navigation
+        window.changeMonth = (delta) => {
+            state.currentDate = new Date(state.currentDate.getFullYear(), state.currentDate.getMonth() + delta, 1);
+            renderCalendar();
+        };
+        window.resetMonth = () => {
+            state.currentDate = new Date();
+            renderCalendar();
+        };
+
+        // Export Actions
+        window.exportImage = async () => {
+            const el = document.getElementById('calendar-capture');
+            const btn = document.getElementById('btn-export-img');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> 製作中...`;
+            lucide.createIcons();
+
+            try {
+                const canvas = await html2canvas(el, { scale: 2, useCORS: true });
+                const link = document.createElement('a');
+                const empName = state.employees.find(e => e.id === state.selectedEmpId)?.name || 'Roster';
+                link.download = `${empName}_更表_${state.currentDate.getFullYear()}-${state.currentDate.getMonth()+1}.png`;
+                link.href = canvas.toDataURL('image/png');
+                link.click();
+            } catch(e) { alert('下載失敗: ' + e.message); }
+            
+            btn.innerHTML = originalText;
+            lucide.createIcons();
+        };
+
+        window.copyText = () => {
+            if(!state.selectedEmpId) return;
+            const empName = state.employees.find(e => e.id === state.selectedEmpId)?.name;
+            const year = state.currentDate.getFullYear();
+            const month = state.currentDate.getMonth() + 1;
+            const daysInM = getDaysInMonth(year, state.currentDate.getMonth());
+            const weekDays = ['日', '一', '二', '三', '四', '五', '六'];
+
+            let text = `【${year}年${month}月更表】\n同事：${empName}\n\n工作安排：\n`;
+            let hasShifts = false;
+
+            for(let d=1; d<=daysInM; d++) {
+                const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+                const shift = state.shifts[dateStr];
+                if(shift === 'SHIFT_A' || shift === 'SHIFT_B') {
+                    const dateObj = new Date(year, state.currentDate.getMonth(), d);
+                    const shiftName = shift === 'SHIFT_A' ? 'Shift A' : 'Shift B';
+                    text += `${month}月${d}日 (${weekDays[dateObj.getDay()]})：${shiftName}\n`;
+                    hasShifts = true;
+                }
+            }
+            if(!hasShifts) text += "本月暫無工作安排\n";
+            text += `\n時間備註：\nShift A：10:00 - 19:00\nShift B：11:00 - 20:00`;
+
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = document.getElementById('btn-copy-text');
+                const original = btn.innerHTML;
+                btn.innerHTML = `<i data-lucide="check" class="w-4 h-4"></i> 已複製`;
+                btn.classList.add('bg-green-600', 'text-white');
+                lucide.createIcons();
+                setTimeout(() => {
+                    btn.innerHTML = original;
+                    btn.classList.remove('bg-green-600', 'text-white');
+                    lucide.createIcons();
+                }, 2000);
+            }).catch(e => alert('複製失敗，請手動複製'));
+        };
+
+        // UI Helpers
+        window.toggleSidebar = () => {
+            const sb = document.getElementById('sidebar');
+            const isOpen = !sb.classList.contains('w-0');
+            if(isOpen) {
+                sb.classList.remove('w-80');
+                sb.classList.add('w-0', 'overflow-hidden');
+            } else {
+                sb.classList.add('w-80');
+                sb.classList.remove('w-0', 'overflow-hidden');
+            }
+        };
+
+        function setSaving(saving) {
+            const el = document.getElementById('save-status');
+            if(saving) {
+                el.innerHTML = `<span class="flex items-center gap-1 text-xs text-blue-600 bg-blue-50 px-2 py-1 rounded-full"><i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i> 正在儲存...</span>`;
+            } else {
+                el.innerHTML = `<span class="flex items-center gap-1 text-xs text-green-600 bg-green-50 px-2 py-1 rounded-full"><i data-lucide="check-circle-2" class="w-3 h-3"></i> 已同步</span>`;
+                setTimeout(() => {
+                   el.innerHTML = `<span class="flex items-center gap-1 text-xs text-gray-400 px-2 py-1"><i data-lucide="cloud" class="w-3 h-3"></i> 雲端已連接</span>`;
+                   lucide.createIcons();
+                }, 2000);
+            }
+            lucide.createIcons();
+        }
+
+        // Init Icons
+        window.onload = () => {
+            lucide.createIcons();
+        }
+
+    </script>
+    <style>
+        /* Custom Scrollbar for better look */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="bg-gray-50 text-slate-800 h-screen flex overflow-hidden font-sans">
+
+    <!-- Sidebar -->
+    <div id="sidebar" class="w-80 bg-white border-r border-gray-200 flex flex-col transition-all duration-300 relative z-10 shadow-lg">
+        <div class="p-5 border-b border-gray-100 bg-slate-50 min-w-[320px]">
+            <div class="flex justify-between items-center">
+                <h2 class="text-xl font-bold flex items-center gap-2 text-slate-800">
+                    <i data-lucide="users" class="w-6 h-6 text-blue-600"></i> 同事名單
+                </h2>
+                <!-- Mobile Close -->
+                <button class="md:hidden p-1" onclick="toggleSidebar()"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <p class="text-xs text-gray-500 mt-1">管理你的 GFE 團隊</p>
+            <div id="auth-loading" class="mt-2 text-xs text-orange-600 bg-orange-50 p-2 rounded flex items-center gap-1">
+                <i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i> 連接資料庫中...
+            </div>
+        </div>
+
+        <div id="employee-list" class="flex-1 overflow-y-auto p-3 space-y-2 min-w-[320px]">
+            <!-- Employee Items will go here -->
+        </div>
+
+        <div class="p-4 border-t border-gray-200 bg-gray-50 min-w-[320px]">
+            <div class="flex gap-2">
+                <input id="new-emp-name" type="text" placeholder="輸入同事名稱..." class="flex-1 px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" onkeydown="if(event.key === 'Enter') addEmployee()">
+                <button onclick="addEmployee()" class="bg-blue-600 text-white p-2 rounded-md hover:bg-blue-700">
+                    <i data-lucide="user-plus" class="w-5 h-5"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="flex-1 flex flex-col h-full relative">
+        <!-- Toolbar -->
+        <div class="h-16 border-b border-gray-200 bg-white flex justify-between items-center px-4 shadow-sm flex-shrink-0">
+            <div class="flex items-center gap-3">
+                <button onclick="toggleSidebar()" class="p-2 rounded-md hover:bg-gray-100 text-gray-600">
+                    <i data-lucide="panel-left-open" class="w-5 h-5"></i>
+                </button>
+                <div class="flex flex-col border-l pl-3 border-gray-300">
+                    <h1 id="header-title" class="text-xl font-bold text-gray-800 hidden md:block">更表系統</h1>
+                    <div id="save-status" class="hidden md:block"></div>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-2">
+                <button onclick="toggleQuickInput()" class="flex items-center gap-1 bg-amber-100 text-amber-800 px-3 py-2 rounded-lg hover:bg-amber-200 text-sm font-medium">
+                    <i data-lucide="zap" class="w-4 h-4"></i> <span class="hidden sm:inline">快速 OFF</span>
+                </button>
+                <button id="btn-copy-text" onclick="copyText()" class="flex items-center gap-2 bg-white text-slate-700 border border-slate-300 px-3 py-2 rounded-lg hover:bg-slate-50 text-sm font-medium">
+                    <i data-lucide="file-text" class="w-4 h-4"></i> <span class="hidden sm:inline">複製文字</span>
+                </button>
+                <button id="btn-export-img" onclick="exportImage()" class="flex items-center gap-2 bg-slate-800 text-white px-3 py-2 rounded-lg hover:bg-slate-900 text-sm font-medium">
+                    <i data-lucide="download" class="w-4 h-4"></i> <span class="hidden sm:inline">下載圖片</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Scrollable Area -->
+        <div class="flex-1 overflow-auto p-4 md:p-8 bg-slate-100 flex justify-center">
+            
+            <!-- Calendar Capture Area -->
+            <div id="calendar-capture" class="bg-white rounded-xl shadow-xl overflow-hidden max-w-5xl w-full border border-gray-200 flex flex-col h-fit">
+                
+                <!-- Calendar Header -->
+                <div class="bg-slate-800 text-white p-6 flex justify-between items-center">
+                    <div class="flex items-center gap-4">
+                        <h2 id="calendar-month-year" class="text-3xl font-bold tracking-tight">2025年 1月</h2>
+                        <div id="calendar-subtitle" class="text-slate-400 text-sm mt-2 font-medium">同事</div>
+                    </div>
+                    <div class="flex items-center gap-1 bg-slate-700 rounded-lg p-1" data-html2canvas-ignore>
+                        <button onclick="changeMonth(-1)" class="p-2 hover:bg-slate-600 rounded-md"><i data-lucide="chevron-left" class="w-5 h-5"></i></button>
+                        <button onclick="resetMonth()" class="px-3 py-1 text-sm font-medium hover:bg-slate-600 rounded-md">本月</button>
+                        <button onclick="changeMonth(1)" class="p-2 hover:bg-slate-600 rounded-md"><i data-lucide="chevron-right" class="w-5 h-5"></i></button>
+                    </div>
+                </div>
+
+                <!-- Days Header -->
+                <div class="grid grid-cols-7 border-b border-gray-200 bg-gray-50">
+                    <div class="py-3 text-center font-bold text-sm text-slate-600">星期一</div>
+                    <div class="py-3 text-center font-bold text-sm text-slate-600">星期二</div>
+                    <div class="py-3 text-center font-bold text-sm text-slate-600">星期三</div>
+                    <div class="py-3 text-center font-bold text-sm text-slate-600">星期四</div>
+                    <div class="py-3 text-center font-bold text-sm text-slate-600">星期五</div>
+                    <div class="py-3 text-center font-bold text-sm text-slate-600">星期六</div>
+                    <div class="py-3 text-center font-bold text-sm text-red-500">星期日</div>
+                </div>
+
+                <!-- Grid -->
+                <div id="calendar-grid" class="grid grid-cols-7 auto-rows-fr bg-gray-200 gap-px border-b border-gray-200">
+                    <!-- JS generated cells -->
+                </div>
+
+                <!-- Footer -->
+                <div class="p-4 bg-white border-t border-gray-200 flex flex-wrap gap-x-8 gap-y-2 text-sm">
+                    <div class="flex items-center gap-2"><div class="w-4 h-4 bg-gray-800 rounded shadow-sm"></div><span class="font-medium">Unavailable (OFF)</span></div>
+                    <div class="flex items-center gap-2"><div class="w-4 h-4 bg-blue-100 border border-blue-200 rounded shadow-sm"></div><span class="font-medium">Shift A (10:00 - 19:00)</span></div>
+                    <div class="flex items-center gap-2"><div class="w-4 h-4 bg-green-100 border border-green-200 rounded shadow-sm"></div><span class="font-medium">Shift B (11:00 - 20:00)</span></div>
+                    <div class="flex items-center gap-2 ml-auto text-red-500 font-medium">* 紅字為公眾假期</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Context Menu for Shift -->
+    <div id="shift-menu" class="hidden fixed z-50 bg-white rounded-xl shadow-2xl border border-gray-200 p-2 flex flex-col gap-1 w-36 animate-in fade-in zoom-in duration-200">
+        <div class="text-xs text-center font-bold text-gray-400 mb-1 border-b pb-1">設定狀態</div>
+        <button onclick="setShift('UNAVAILABLE')" class="flex items-center gap-2 px-3 py-2 text-sm text-white bg-gray-800 rounded hover:bg-gray-900"><i data-lucide="ban" class="w-4 h-4"></i> 唔返得</button>
+        <button onclick="setShift('SHIFT_A')" class="flex items-center gap-2 px-3 py-2 text-sm text-blue-800 bg-blue-100 rounded hover:bg-blue-200"><i data-lucide="sun" class="w-4 h-4"></i> Shift A</button>
+        <button onclick="setShift('SHIFT_B')" class="flex items-center gap-2 px-3 py-2 text-sm text-green-800 bg-green-100 rounded hover:bg-green-200"><i data-lucide="moon" class="w-4 h-4"></i> Shift B</button>
+        <button onclick="setShift('CLEAR')" class="flex items-center gap-2 px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded"><i data-lucide="trash-2" class="w-4 h-4"></i> 清除</button>
+    </div>
+
+    <!-- Quick Input Modal -->
+    <div id="quick-input-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 relative">
+            <button onclick="toggleQuickInput()" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600"><i data-lucide="x" class="w-5 h-5"></i></button>
+            <h3 class="text-lg font-bold text-gray-800 mb-2 flex items-center gap-2"><i data-lucide="zap" class="w-5 h-5 text-amber-500"></i> 快速輸入不能上班日子</h3>
+            <p class="text-sm text-gray-500 mb-4">輸入日期數字，用逗號或空白分隔。<br>例如：<code class="bg-gray-100 px-1 rounded">1, 5, 12, 20</code></p>
+            <textarea id="quick-input-text" class="w-full h-24 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 resize-none mb-4 font-mono text-lg" placeholder="1, 5, 12..."></textarea>
+            <div class="flex justify-end gap-2">
+                <button onclick="toggleQuickInput()" class="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg">取消</button>
+                <button onclick="submitQuickInput()" class="px-4 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 font-medium">確認並更新</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
